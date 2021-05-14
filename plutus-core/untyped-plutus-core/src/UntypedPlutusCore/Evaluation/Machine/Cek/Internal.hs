@@ -67,6 +67,7 @@ import           Data.Hashable                                            (Hasha
 import qualified Data.Kind                                                as GHC
 import           Data.Proxy
 import           Data.STRef
+import           Data.Semigroup                                           (stimes)
 import           Data.Text.Prettyprint.Doc
 
 {- Note [Compilation peculiarities]
@@ -126,14 +127,7 @@ prerequisite. The CEK machine correctly handles name shadowing.
 -}
 
 data ExBudgetCategory fun
-    = BConst
-    | BVar
-    | BLamAbs
-    | BApply
-    | BDelay
-    | BForce
-    | BError
-    | BBuiltin         -- Cost of evaluating a Builtin AST node
+    = BStep
     | BBuiltinApp fun  -- Cost of evaluating a fully applied builtin function
     | BStartup
     deriving stock (Show, Eq, Ord, Generic)
@@ -190,7 +184,7 @@ newtype CekBudgetSpender fun s = CekBudgetSpender
 -- | Runtime budgeting info.
 data ExBudgetInfo cost fun s = ExBudgetInfo
     { _exBudgetModeSpender  :: !(CekBudgetSpender fun s)  -- ^ A spending function.
-    , _exBudgetModeGetFinal :: !(ST s cost)                        -- ^ For accessing the final state.
+    , _exBudgetModeGetFinal :: !(ST s cost)               -- ^ For accessing the final state.
     }
 
 -- We make a separate data type here just to save the caller of the CEK machine from those pesky
@@ -201,6 +195,22 @@ data ExBudgetInfo cost fun s = ExBudgetInfo
 newtype ExBudgetMode cost (uni :: GHC.Type -> GHC.Type) fun = ExBudgetMode
     { unExBudgetMode :: forall s. ST s (ExBudgetInfo cost fun s)
     }
+
+{- Note [Cost slippage]
+Tracking the budget usage for every step in the machine adds a lot of overhead. To reduce this,
+we adopt a technique which allows some overshoot of the budget ("slippage"), but only a bounded
+amount.
+
+To do this we:
+- Assume that all machine steps take the same time, so we can track the "pending budget due to
+machine steps" as a simple 'Int'.
+- Actually "spend" the budget when we've done more than some fixed number of steps, or at the end.
+
+This saves a *lot* of time, at the cost of potentially overshooting the budget by slippage*step_cost,
+which is okay so long as we bound the slippage appropriately.
+-}
+
+type Slippage = Int
 
 {- Note [Implicit parameters in the machine]
 The traditional way to pass context into a function is to use 'ReaderT'. However, 'ReaderT' has some
@@ -463,12 +473,13 @@ lookupVarName varName varEnv = do
 enterComputeCek
     :: forall uni fun s
     . (Ix fun, PrettyUni uni fun, GivenCekReqs uni fun s)
-    => CekMachineCosts
+    => Slippage
+    -> CekMachineCosts
     -> Context uni fun
     -> CekValEnv uni fun
     -> TermWithMem uni fun
     -> CekM s (Term Name uni fun ())
-enterComputeCek costs = computeCek where
+enterComputeCek slippage costs = computeCek 0 where
     -- | The computing part of the CEK machine.
     -- Either
     -- 1. adds a frame to the context and calls 'computeCek' ('Force', 'Apply')
@@ -476,41 +487,42 @@ enterComputeCek costs = computeCek where
     -- 3. returns 'EvaluationFailure' ('Error')
     -- 4. looks up a variable in the environment and calls 'returnCek' ('Var')
     computeCek
-        :: Context uni fun
+        :: Int
+        -> Context uni fun
         -> CekValEnv uni fun
         -> TermWithMem uni fun
         -> CekM s (Term Name uni fun ())
     -- s ; ρ ▻ {L A}  ↦ s , {_ A} ; ρ ▻ L
-    computeCek ctx env (Var _ varName) = do
-        spendBudgetCek BVar (cekVarCost costs)
+    computeCek bacc ctx env (Var _ varName) = do
+        bacc' <- maybeSpendBudget bacc
         val <- lookupVarName varName env
-        returnCek ctx val
-    computeCek ctx _ (Constant ex val) = do
-        spendBudgetCek BConst (cekConstCost costs)
-        returnCek ctx (VCon ex val)
-    computeCek ctx env (LamAbs ex name body) = do
-        spendBudgetCek BLamAbs (cekLamCost costs)
-        returnCek ctx (VLamAbs ex name body env)
-    computeCek ctx env (Delay ex body) = do
-        spendBudgetCek BDelay (cekDelayCost costs)
-        returnCek ctx (VDelay ex body env)
+        returnCek (bacc' +1) ctx val
+    computeCek bacc ctx _ (Constant ex val) = do
+        bacc' <- maybeSpendBudget bacc
+        returnCek (bacc' +1) ctx (VCon ex val)
+    computeCek bacc ctx env (LamAbs ex name body) = do
+        bacc' <- maybeSpendBudget bacc
+        returnCek (bacc' +1) ctx (VLamAbs ex name body env)
+    computeCek bacc ctx env (Delay ex body) = do
+        bacc' <- maybeSpendBudget bacc
+        returnCek (bacc' +1) ctx (VDelay ex body env)
     -- s ; ρ ▻ lam x L  ↦  s ◅ lam x (L , ρ)
-    computeCek ctx env (Force _ body) = do
-        spendBudgetCek BForce (cekForceCost costs)
-        computeCek (FrameForce : ctx) env body
+    computeCek bacc ctx env (Force _ body) = do
+        bacc' <- maybeSpendBudget bacc
+        computeCek (bacc' +1) (FrameForce : ctx) env body
     -- s ; ρ ▻ [L M]  ↦  s , [_ (M,ρ)]  ; ρ ▻ L
-    computeCek ctx env (Apply _ fun arg) = do
-        spendBudgetCek BApply (cekApplyCost costs)
-        computeCek (FrameApplyArg env arg : ctx) env fun
+    computeCek bacc ctx env (Apply _ fun arg) = do
+        bacc' <- maybeSpendBudget bacc
+        computeCek (bacc' +1) (FrameApplyArg env arg : ctx) env fun
     -- s ; ρ ▻ abs α L  ↦  s ◅ abs α (L , ρ)
     -- s ; ρ ▻ con c  ↦  s ◅ con c
     -- s ; ρ ▻ builtin bn  ↦  s ◅ builtin bn arity arity [] [] ρ
-    computeCek ctx _ (Builtin ex bn) = do
-        spendBudgetCek BBuiltin (cekBuiltinCost costs)
+    computeCek bacc ctx _ (Builtin ex bn) = do
+        bacc' <- maybeSpendBudget bacc
         BuiltinRuntime _ arity _ _ <- lookupBuiltinExc (Proxy @(CekEvaluationException uni fun)) bn ?cekRuntime
-        returnCek ctx (VBuiltin ex bn arity arity 0 [])
+        returnCek (bacc' +1) ctx (VBuiltin ex bn arity arity 0 [])
     -- s ; ρ ▻ error A  ↦  <> A
-    computeCek _ _ (Error _) = do
+    computeCek _ _ _ (Error _) = do
         throwingCek @uni @fun _EvaluationFailure ()
 
     {- | The returning phase of the CEK machine.
@@ -527,19 +539,21 @@ enterComputeCek costs = computeCek where
           return the result, or extend the value with the new argument and call
           returnCek.  If v is anything else, fail.
     -}
-    returnCek :: Context uni fun -> CekValue uni fun -> CekM s (Term Name uni fun ())
+    returnCek :: Int -> Context uni fun -> CekValue uni fun -> CekM s (Term Name uni fun ())
     --- Instantiate all the free variable of the resulting term in case there are any.
     -- . ◅ V           ↦  [] V
-    returnCek [] val = pure $ void $ dischargeCekValue val
+    returnCek bacc [] val = do
+        spendAccumulatedBudget bacc
+        pure $ void $ dischargeCekValue val
     -- s , {_ A} ◅ abs α M  ↦  s ; ρ ▻ M [ α / A ]*
-    returnCek (FrameForce : ctx) fun = forceEvaluate ctx fun
+    returnCek bacc (FrameForce : ctx) fun = forceEvaluate bacc ctx fun
     -- s , [_ (M,ρ)] ◅ V  ↦  s , [V _] ; ρ ▻ M
-    returnCek (FrameApplyArg argVarEnv arg : ctx) fun = do
-        computeCek (FrameApplyFun fun : ctx) argVarEnv arg
+    returnCek bacc (FrameApplyArg argVarEnv arg : ctx) fun = do
+        computeCek bacc (FrameApplyFun fun : ctx) argVarEnv arg
     -- s , [(lam x (M,ρ)) _] ◅ V  ↦  s ; ρ [ x  ↦  V ] ▻ M
     -- FIXME: add rule for VBuiltin once it's in the specification.
-    returnCek (FrameApplyFun fun : ctx) arg = do
-        applyEvaluate ctx fun arg
+    returnCek bacc (FrameApplyFun fun : ctx) arg = do
+        applyEvaluate bacc ctx fun arg
 
     {- Note [Accumulating arguments].  The VBuiltin value contains lists of type and
     term arguments which grow as new arguments are encountered.  In the code below
@@ -561,9 +575,9 @@ enterComputeCek costs = computeCek where
     -- or extend the value with @force@ and call returnCek;
     -- if v is anything else, fail.
     forceEvaluate
-        :: Context uni fun -> CekValue uni fun -> CekM s (Term Name uni fun ())
-    forceEvaluate ctx (VDelay _ body env) = computeCek ctx env body
-    forceEvaluate ctx val@(VBuiltin ex bn arity0 arity forces args) =
+        :: Int -> Context uni fun -> CekValue uni fun -> CekM s (Term Name uni fun ())
+    forceEvaluate bacc ctx (VDelay _ body env) = computeCek bacc ctx env body
+    forceEvaluate bacc ctx val@(VBuiltin ex bn arity0 arity forces args) =
         case arity of
           []             ->
               throwingDischarged _MachineError EmptyBuiltinArityMachineError val
@@ -575,9 +589,9 @@ enterComputeCek costs = computeCek where
                             where val' = VBuiltin ex bn arity0 arity (forces + 1) args -- reconstruct the bad application
           TypeArg:arity' ->
               case arity' of
-                [] -> applyBuiltin ctx bn args  -- Final argument is a type argument
-                _  -> returnCek ctx $ VBuiltin ex bn arity0 arity' (forces + 1) args -- More arguments expected
-    forceEvaluate _ val =
+                [] -> applyBuiltin bacc ctx bn args  -- Final argument is a type argument
+                _  -> returnCek bacc ctx $ VBuiltin ex bn arity0 arity' (forces + 1) args -- More arguments expected
+    forceEvaluate _ _ val =
             throwingDischarged _MachineError NonPolymorphicInstantiationMachineError val
 
     -- | Apply a function to an argument and proceed.
@@ -587,13 +601,14 @@ enterComputeCek costs = computeCek where
     -- it's the final argument then apply the builtin to its arguments, return the result, or extend
     -- the value with the new argument and call 'returnCek'. If v is anything else, fail.
     applyEvaluate
-        :: Context uni fun
+        :: Int
+        -> Context uni fun
         -> CekValue uni fun   -- lhs of application
         -> CekValue uni fun   -- rhs of application
         -> CekM s (Term Name uni fun ())
-    applyEvaluate ctx (VLamAbs _ name body env) arg =
-        computeCek ctx (extendEnv name arg env) body
-    applyEvaluate ctx val@(VBuiltin ex bn arity0 arity forces args) arg = do
+    applyEvaluate bacc ctx (VLamAbs _ name body env) arg =
+        computeCek bacc ctx (extendEnv name arg env) body
+    applyEvaluate bacc ctx val@(VBuiltin ex bn arity0 arity forces args) arg = do
         case arity of
           []        -> throwingDischarged _MachineError EmptyBuiltinArityMachineError val
                     -- Should be impossible: see forceEvaluate.
@@ -602,17 +617,18 @@ enterComputeCek costs = computeCek where
           TermArg:arity' -> do
               let args' = args ++ [arg]
               case arity' of
-                [] -> applyBuiltin ctx bn args' -- 'arg' was the final argument
-                _  -> returnCek ctx $ VBuiltin ex bn arity0 arity' forces args'  -- More arguments expected
-    applyEvaluate _ val _ = throwingDischarged _MachineError NonFunctionalApplicationMachineError val
+                [] -> applyBuiltin bacc ctx bn args' -- 'arg' was the final argument
+                _  -> returnCek bacc ctx $ VBuiltin ex bn arity0 arity' forces args'  -- More arguments expected
+    applyEvaluate _ _ val _ = throwingDischarged _MachineError NonFunctionalApplicationMachineError val
 
     -- | Apply a builtin to a list of CekValue arguments
     applyBuiltin
-        :: Context uni fun
+        :: Int
+        -> Context uni fun
         -> fun
         -> [CekValue uni fun]
         -> CekM s (Term Name uni fun ())
-    applyBuiltin ctx bn args = do
+    applyBuiltin bacc ctx bn args = do
       BuiltinRuntime sch _ f exF <- lookupBuiltinExc (Proxy @(CekEvaluationException uni fun)) bn ?cekRuntime
 
       let
@@ -628,7 +644,15 @@ enterComputeCek costs = computeCek where
       case resultOrErr of
           -- Turn the cause of a possible failure, being a 'CekValue', into a 'Term'.
           Left e       -> throwCek $ mapCauseInMachineException (void . dischargeCekValue) e
-          Right result -> returnCek ctx result
+          Right result -> returnCek bacc ctx result
+
+    -- | Spend the budget that has been accumulated for a number of machine steps.
+    spendAccumulatedBudget :: Int -> CekM s ()
+    spendAccumulatedBudget bacc = spendBudgetCek BStep (stimes bacc (cekStepCost costs))
+
+    -- | Spend the budget that has accumulated for a number of machine steps, but only if we've exceeded our slippage.
+    maybeSpendBudget :: Int -> CekM s Int
+    maybeSpendBudget bacc = if bacc >= slippage then spendAccumulatedBudget bacc >> pure 0 else pure bacc
 
 -- See Note [Compilation peculiarities].
 -- | Evaluate a term using the CEK machine and keep track of costing, logging is optional.
@@ -642,8 +666,11 @@ runCek
 runCek (MachineParameters cekcosts runtime) mode emitting term =
     runCekM runtime mode emitting $ do
         spendBudgetCek BStartup (cekStartupCost cekcosts)
-        enterComputeCek cekcosts [] mempty memTerm
+        enterComputeCek slippage cekcosts [] mempty memTerm
   where
+    -- The number of machine steps which may pass before we actually account for the step
+    -- budget
+    slippage = 100
     memTerm = withMemory term
     {- This is a temporary workaround for a bug where every AST node was being
        annotated with the size of the entire AST, leading to the costing
